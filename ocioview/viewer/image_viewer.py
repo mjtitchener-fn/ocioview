@@ -10,7 +10,6 @@ from typing import Generator, Optional, Union
 import PyOpenColorIO as ocio
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from ..config_cache import ConfigCache
 from ..constants import (
     GRAY_COLOR,
     R_COLOR,
@@ -22,12 +21,12 @@ from ..items.display_model import DisplayModel
 from ..items.view_model import ViewModel
 from ..mode import OCIOViewMode
 from ..processor_context import ProcessorContext
-from ..ref_space_manager import ReferenceSpaceManager
 from ..signal_router import SignalRouter
-from ..transform_manager import TransformManager
 from ..utils import float_to_uint8, get_glyph_icon, SignalsBlocked
 from ..widgets import ComboBox, CallbackComboBox, ColorSpaceComboBox
 from .image_plane import ImagePlane
+from .transform_builder import ViewerTransformBuilder
+from .viewport_subscription import ViewportSubscription
 
 
 class ViewerChannels(object):
@@ -71,6 +70,9 @@ class ImageViewer(QtWidgets.QWidget):
 
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None):
         super().__init__(parent)
+
+        self._subscription = ViewportSubscription()
+        self._subscription.set_transforms_callback(self.set_transform)
 
         self._sample_format = ""
         self._tf_subscription_slot = -1
@@ -398,8 +400,9 @@ class ImageViewer(QtWidgets.QWidget):
             self._on_sample_precision_changed
         )
 
-        signal_router = SignalRouter.get_instance()
-        signal_router.mode_changed.connect(self._on_mode_changed)
+        self._subscription.connect_signal(
+            SignalRouter.get_instance().mode_changed, self._on_mode_changed
+        )
 
         # Edit mode
         self.image_plane.tf_subscription_requested.connect(
@@ -419,10 +422,10 @@ class ImageViewer(QtWidgets.QWidget):
         self._on_sample_changed(-1, -1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
         # Edit mode
-        TransformManager.subscribe_to_transform_menu(
+        self._subscription.subscribe_transform_menu(
             self._on_transform_menu_changed
         )
-        TransformManager.subscribe_to_transform_subscription_init(
+        self._subscription.subscribe_transform_subscription_init(
             self._on_transform_subscription_init
         )
 
@@ -645,104 +648,49 @@ class ImageViewer(QtWidgets.QWidget):
 
     def _make_processor_context(self) -> ProcessorContext:
         """Create processor context from available data."""
-        mode = OCIOViewMode.current_mode()
-        if mode == OCIOViewMode.Preview:
-            return ProcessorContext(
-                self.input_color_space(),
-                ViewModel.__item_type__,
-                self.view(),
-                ocio.TRANSFORM_DIR_FORWARD,
-            )
-        else:  # Edit
-            return ProcessorContext(
-                self.input_color_space(),
-                self.transform_item_type(),
-                self.transform_item_name(),
-                self.transform_direction(),
-            )
+        return ViewerTransformBuilder.make_processor_context(
+            mode=OCIOViewMode.current_mode(),
+            input_color_space=self.input_color_space(),
+            view=self.view(),
+            transform_item_type=self.transform_item_type(),
+            transform_item_name=self.transform_item_name(),
+            transform_direction=self.transform_direction(),
+        )
 
     def _make_transform(self) -> Union[ocio.Transform, None]:
         """Create viewer transform."""
-        transform = None
-        mode = OCIOViewMode.current_mode()
-
-        if mode == OCIOViewMode.Preview:
-            display = self.display()
-            view = self.view()
-
-            if display and view:
-                # Image plane expects all transforms to be relative to the current
-                # config's scene reference space.
-                transform = ocio.DisplayViewTransform(
-                    src=ReferenceSpaceManager.scene_reference_space().getName(),
-                    display=display,
-                    view=view,
-                    direction=ocio.TRANSFORM_DIR_FORWARD,
-                )
-
-        else:  # Edit
-            if self._tf_fwd is not None and self._tf_inv is not None:
-                if self.transform_direction() == ocio.TRANSFORM_DIR_INVERSE:
-                    return self._tf_inv
-                else:
-                    return self._tf_fwd
-            else:
-                # Return no-op transform. Returning None instead results in the image
-                # plane processor being unchanged, which is problematic when switching
-                # application modes, since it will retain the previous display/view
-                # transform.
-                return ocio.ExponentTransform()
-
-        return transform
+        return ViewerTransformBuilder.make_transform(
+            mode=OCIOViewMode.current_mode(),
+            display=self.display(),
+            view=self.view(),
+            transform_fwd=self._tf_fwd,
+            transform_inv=self._tf_inv,
+            transform_direction=self.transform_direction(),
+        )
 
     def _get_default_color_space(self) -> str:
         """Get reasonable default color space."""
-        all_color_spaces = ConfigCache.get_color_space_names(
-            ocio.SEARCH_REFERENCE_SPACE_SCENE
-        )
-        default_color_space = ConfigCache.get_default_color_space_name()
-        if (
-            default_color_space is not None
-            and default_color_space in all_color_spaces
-        ):
-            return default_color_space
-        elif all_color_spaces:
-            return all_color_spaces[0]
-        else:
-            return ""
+        return ViewerTransformBuilder.default_color_space()
 
     def _get_displays(self) -> list[str]:
         """Get all active OCIO displays."""
-        config = ocio.GetCurrentConfig()
-        return list(config.getDisplays())
+        return ViewerTransformBuilder.displays()
 
     def _get_default_display(self) -> str:
         """Get default OCIO display."""
-        config = ocio.GetCurrentConfig()
-        return config.getDefaultDisplay()
+        return ViewerTransformBuilder.default_display()
 
     def _get_views(self) -> list[str]:
-        """
-        Get all active OCIO views, given the current input color space.
-        """
-        config = ocio.GetCurrentConfig()
-        input_color_space = self.input_color_space()
-        if input_color_space:
-            return config.getViews(self.display(), input_color_space)
-        else:
-            return config.getViews(self.display())
+        """Get all active OCIO views, given the current input color space."""
+        return ViewerTransformBuilder.views(
+            self.display(), self.input_color_space()
+        )
 
     def _get_default_view(self) -> str:
-        """
-        Get default OCIO view, given the current display and input
-        color space.
-        """
-        config = ocio.GetCurrentConfig()
-        input_color_space = None
-        if input_color_space:
-            return config.getDefaultView(self.display(), input_color_space)
-        else:
-            return config.getDefaultView(self.display())
+        """Get default OCIO view for the current display and input color space."""
+        return ViewerTransformBuilder.default_view(
+            self.display(), self.input_color_space()
+        )
 
     def _on_mode_changed(self) -> None:
         """Called when the application mode changes."""
@@ -922,30 +870,19 @@ class ImageViewer(QtWidgets.QWidget):
         Must be called before the viewer is destroyed (e.g. on tab close) so
         the global routers do not retain callbacks into a dead widget.
         """
-        SignalRouter.get_instance().mode_changed.disconnect(
-            self._on_mode_changed
-        )
-        TransformManager.unsubscribe_from_transform_menu(
-            self._on_transform_menu_changed
-        )
-        TransformManager.unsubscribe_from_transform_subscription_init(
-            self._on_transform_subscription_init
-        )
-        TransformManager.unsubscribe_from_all_transforms(self.set_transform)
+        self._subscription.teardown()
 
     @QtCore.Slot(int)
     def _on_transform_changed(self, index: int) -> None:
         if index == 0:
-            TransformManager.unsubscribe_from_all_transforms(
-                self.set_transform
-            )
+            self._subscription.unsubscribe_transforms()
             self.clear_transform()
         else:
             self._tf_subscription_slot = self.tf_box.currentData(
                 role=self.ROLE_SLOT
             )
-            TransformManager.subscribe_to_transforms_at(
-                self._tf_subscription_slot, self.set_transform
+            self._subscription.subscribe_transforms_at(
+                self._tf_subscription_slot
             )
 
     @QtCore.Slot(int)

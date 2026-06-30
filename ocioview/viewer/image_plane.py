@@ -7,7 +7,6 @@
 
 from __future__ import annotations
 
-import ctypes
 import logging
 import math
 from functools import partial
@@ -23,8 +22,15 @@ from PySide6 import QtCore, QtGui, QtWidgets, QtOpenGLWidgets
 from ..log_handlers import message_queue
 from ..processor_context import ProcessorContext
 from ..ref_space_manager import ReferenceSpaceManager
-from .utils import load_image, model_view_matrix, orthographic_proj_matrix
-
+from .utils import load_image
+from .camera import PanZoomCamera2D
+from .geometry import ImagePlaneGeometry
+from .ocio_pipeline import (
+    OCIOGpuPipeline,
+    build_viewing_pipelines,
+    next_channel_hot,
+    set_texture_interp,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -125,14 +131,7 @@ class ImagePlane(QtOpenGLWidgets.QOpenGLWidget):
         self._ocio_proc_cpu = None
         self._ocio_proc_cache_id = None
         self._ocio_shader_cache_id = None
-        self._ocio_shader_desc = None
-        self._ocio_tex_start_index = 1  # Start after image_tex
-        self._ocio_tex_ids = []
-        self._ocio_uniform_ids = {}
-
-        # MVP matrix components
-        self._model_view_mat = np.eye(4)
-        self._proj_mat = np.eye(4)
+        self.ocio_pipeline = OCIOGpuPipeline(self.makeCurrent)
 
         # Keyboard shortcuts
         self._shortcuts = []
@@ -143,16 +142,12 @@ class ImagePlane(QtOpenGLWidgets.QOpenGLWidget):
 
         # Image texture
         self._image_array = None
-        self._image_tex = None
-        self._image_pos = np.array([0.0, 0.0])
-        self._image_size = np.array([1.0, 1.0])
-        self._image_scale = 1.0
 
-        # Image plane VAO
-        self._plane_vao = None
-        self._plane_position_vbo = None
-        self._plane_tex_coord_vbo = None
-        self._plane_index_vbo = None
+        # 2D pan/zoom/fit camera (owns image pos/size/scale + matrices)
+        self.camera = PanZoomCamera2D()
+
+        # Image plane GL geometry (image texture + textured-quad VAO/VBOs)
+        self.geometry = ImagePlaneGeometry(self.makeCurrent)
 
         # GLSL shader program
         self._vert_shader = None
@@ -174,109 +169,8 @@ class ImagePlane(QtOpenGLWidgets.QOpenGLWidget):
         while GL.glGetError() != GL.GL_NO_ERROR:
             pass
 
-        # Init image texture
-        self._image_tex = GL.glGenTextures(1)
-        GL.glActiveTexture(GL.GL_TEXTURE0)
-        GL.glBindTexture(GL.GL_TEXTURE_2D, self._image_tex)
-        GL.glTexImage2D(
-            GL.GL_TEXTURE_2D,
-            0,
-            GL.GL_RGB32F,
-            self._image_size[0],
-            self._image_size[1],
-            0,
-            GL.GL_RGB,
-            GL.GL_FLOAT,
-            ctypes.c_void_p(0),
-        )
-
-        GL.glTexParameteri(
-            GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_S, GL.GL_CLAMP_TO_EDGE
-        )
-        GL.glTexParameteri(
-            GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_T, GL.GL_CLAMP_TO_EDGE
-        )
-        self._set_ocio_tex_params(GL.GL_TEXTURE_2D, ocio.INTERP_LINEAR)
-
-        # Init image plane
-        # fmt: off
-        plane_position_data = np.array(
-            [
-                -0.5,
-                 0.5,
-                 0.0,  # top-left
-                 0.5,
-                 0.5,
-                 0.0,  # top-right
-                 0.5,
-                -0.5,
-                 0.0,  # bottom-right
-                -0.5,
-                -0.5,
-                 0.0,  # bottom-left
-            ],
-            dtype=np.float32,
-        )
-        # fmt: on
-
-        plane_tex_coord_data = np.array(
-            [
-                0.0,
-                1.0,  # top-left
-                1.0,
-                1.0,  # top-right
-                1.0,
-                0.0,  # bottom-right
-                0.0,
-                0.0,  # bottom-left
-            ],
-            dtype=np.float32,
-        )
-
-        plane_index_data = np.array(
-            [0, 1, 2, 0, 2, 3],  # triangles: top-left, bottom-right
-            dtype=np.uint32,
-        )
-
-        self._plane_vao = GL.glGenVertexArrays(1)
-        GL.glBindVertexArray(self._plane_vao)
-
-        (
-            self._plane_position_vbo,
-            self._plane_tex_coord_vbo,
-            self._plane_index_vbo,
-        ) = GL.glGenBuffers(3)
-
-        GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self._plane_position_vbo)
-        GL.glBufferData(
-            GL.GL_ARRAY_BUFFER,
-            plane_position_data.nbytes,
-            plane_position_data,
-            GL.GL_STATIC_DRAW,
-        )
-        GL.glVertexAttribPointer(
-            0, 3, GL.GL_FLOAT, GL.GL_FALSE, 0, ctypes.c_void_p(0)
-        )
-        GL.glEnableVertexAttribArray(0)
-
-        GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self._plane_tex_coord_vbo)
-        GL.glBufferData(
-            GL.GL_ARRAY_BUFFER,
-            plane_tex_coord_data.nbytes,
-            plane_tex_coord_data,
-            GL.GL_STATIC_DRAW,
-        )
-        GL.glVertexAttribPointer(
-            1, 2, GL.GL_FLOAT, GL.GL_FALSE, 0, ctypes.c_void_p(0)
-        )
-        GL.glEnableVertexAttribArray(1)
-
-        GL.glBindBuffer(GL.GL_ELEMENT_ARRAY_BUFFER, self._plane_index_vbo)
-        GL.glBufferData(
-            GL.GL_ELEMENT_ARRAY_BUFFER,
-            plane_index_data.nbytes,
-            plane_index_data,
-            GL.GL_STATIC_DRAW,
+        self.geometry.initialize(
+            self.camera.image_size[0], self.camera.image_size[1]
         )
 
         self._build_program()
@@ -295,19 +189,8 @@ class ImagePlane(QtOpenGLWidgets.QOpenGLWidget):
 
         GL.glViewport(0, 0, w, h)
 
-        # Center image plane
-        # fmt: off
-        self._proj_mat = self._orthographic_proj_matrix(
-            -1.0,      # Near
-             1.0,      # Far
-            -w / 2.0,  # Left
-             w / 2.0,  # Right
-             h / 2.0,  # Top
-            -h / 2.0,  # Bottom
-        )
-        # fmt: on
-
-        self._update_model_view_mat()
+        self.camera.resize(w, h)
+        self._refresh_tex_interp()
 
     def paintGL(self) -> None:
         """
@@ -322,11 +205,11 @@ class ImagePlane(QtOpenGLWidgets.QOpenGLWidget):
         if self._shader_program is not None:
             GL.glUseProgram(self._shader_program)
 
-            self._use_ocio_tex()
-            self._use_ocio_uniforms()
+            self.ocio_pipeline.use_textures(self._shader_program)
+            self.ocio_pipeline.use_uniforms(self._shader_program)
 
             # Set uniforms
-            mvp_mat = self._proj_mat @ self._model_view_mat
+            mvp_mat = self.camera.mvp()
             mvp_mat_loc = GL.glGetUniformLocation(
                 self._shader_program, "mvpMat"
             )
@@ -338,16 +221,7 @@ class ImagePlane(QtOpenGLWidgets.QOpenGLWidget):
             GL.glUniform1i(image_tex_loc, 0)
 
             # Bind texture, VAO, and draw
-            GL.glActiveTexture(GL.GL_TEXTURE0 + 0)
-            GL.glBindTexture(GL.GL_TEXTURE_2D, self._image_tex)
-
-            GL.glBindVertexArray(self._plane_vao)
-
-            GL.glDrawElements(
-                GL.GL_TRIANGLES, 6, GL.GL_UNSIGNED_INT, ctypes.c_void_p(0)
-            )
-
-            GL.glBindVertexArray(0)
+            self.geometry.draw()
 
     def load_image(self, image_path: Path) -> None:
         """
@@ -385,28 +259,12 @@ class ImagePlane(QtOpenGLWidgets.QOpenGLWidget):
         height = self._image_array.shape[0]
 
         # Stash image size for pan/zoom calculations
-        self._image_pos = np.array([0, 1], dtype=np.float64)
-        self._image_size = np.array([width, height], dtype=np.float64)
+        self.camera.set_image_size(width, height)
 
         # Load image data into texture
-        self.makeCurrent()
+        self.geometry.upload_image(self._image_array, width, height)
 
-        GL.glBindTexture(GL.GL_TEXTURE_2D, self._image_tex)
-        GL.glTexImage2D(
-            GL.GL_TEXTURE_2D,
-            0,
-            GL.GL_RGB32F,
-            width,
-            height,
-            0,
-            GL.GL_RGB,
-            GL.GL_FLOAT,
-            self._image_array.ravel(),
-        )
-
-        self.image_loaded.emit(
-            image_path, int(self._image_size[0]), int(self._image_size[1])
-        )
+        self.image_loaded.emit(image_path, width, height)
 
         self.update_ocio_proc(proc_context=proc_context)
         self.fit()
@@ -500,88 +358,23 @@ class ImagePlane(QtOpenGLWidgets.QOpenGLWidget):
             self._update_ocio_channel_hot(channel)
 
         config = ocio.GetCurrentConfig()
-        has_scene_linear = config.hasRole(ocio.ROLE_SCENE_LINEAR)
+        input_color_space = (
+            self._ocio_proc_context.input_color_space
+            if self._ocio_proc_context
+            else None
+        )
         scene_ref_name = (
             ReferenceSpaceManager.scene_reference_space().getName()
         )
 
-        # Build simplified viewing pipeline:
-        # - GPU: For viewport rendering
-        # - CPU: For pixel sampling, sans viewport adjustments
-        gpu_viewing_pipeline = ocio.GroupTransform()
-        cpu_viewing_pipeline = ocio.GroupTransform()
-
-        # Convert to scene linear space if input space is known
-        if (
-            has_scene_linear
-            and self._ocio_proc_context
-            and self._ocio_proc_context.input_color_space
-        ):
-            to_scene_linear = ocio.ColorSpaceTransform(
-                src=self._ocio_proc_context.input_color_space,
-                dst=ocio.ROLE_SCENE_LINEAR,
-            )
-            gpu_viewing_pipeline.appendTransform(to_scene_linear)
-            cpu_viewing_pipeline.appendTransform(to_scene_linear)
-
-        # Dynamic exposure adjustment
-        gpu_viewing_pipeline.appendTransform(
-            ocio.ExposureContrastTransform(
-                exposure=self._ocio_exposure, dynamicExposure=True
-            )
-        )
-
-        # Convert to the scene reference space, which is the expected input space for
-        # all provided transforms. If the input color space is not known, the transform
-        # will be applied to unmodified input pixels.
-        if (
-            self._ocio_proc_context
-            and self._ocio_proc_context.input_color_space
-        ):
-            if has_scene_linear:
-                to_scene_ref = ocio.ColorSpaceTransform(
-                    src=ocio.ROLE_SCENE_LINEAR, dst=scene_ref_name
-                )
-                gpu_viewing_pipeline.appendTransform(to_scene_ref)
-                cpu_viewing_pipeline.appendTransform(to_scene_ref)
-            else:
-                to_scene_ref = ocio.ColorSpaceTransform(
-                    src=self._ocio_proc_context.input_color_space,
-                    dst=scene_ref_name,
-                )
-                gpu_viewing_pipeline.appendTransform(to_scene_ref)
-                cpu_viewing_pipeline.appendTransform(to_scene_ref)
-
-        # Main transform
-        if self._ocio_tf is not None:
-            gpu_viewing_pipeline.appendTransform(self._ocio_tf)
-            cpu_viewing_pipeline.appendTransform(self._ocio_tf)
-
-        # Or restore input color space, if known
-        elif (
-            self._ocio_proc_context
-            and self._ocio_proc_context.input_color_space
-        ):
-            from_scene_ref = ocio.ColorSpaceTransform(
-                src=scene_ref_name,
-                dst=self._ocio_proc_context.input_color_space,
-            )
-            gpu_viewing_pipeline.appendTransform(from_scene_ref)
-            cpu_viewing_pipeline.appendTransform(from_scene_ref)
-
-        # Channel view
-        gpu_viewing_pipeline.appendTransform(
-            ocio.MatrixTransform.View(
-                channelHot=self._ocio_channel_hot,
-                lumaCoef=config.getDefaultLumaCoefs(),
-            )
-        )
-
-        # Dynamic gamma adjustment
-        gpu_viewing_pipeline.appendTransform(
-            ocio.ExposureContrastTransform(
-                gamma=self._ocio_gamma, pivot=1.0, dynamicGamma=True
-            )
+        gpu_viewing_pipeline, cpu_viewing_pipeline = build_viewing_pipelines(
+            config=config,
+            input_color_space=input_color_space,
+            transform=self._ocio_tf,
+            exposure=self._ocio_exposure,
+            gamma=self._ocio_gamma,
+            channel_hot=self._ocio_channel_hot,
+            scene_ref_name=scene_ref_name,
         )
 
         # Create GPU processor
@@ -603,21 +396,22 @@ class ImagePlane(QtOpenGLWidgets.QOpenGLWidget):
             self._ocio_proc_cpu = cpu_proc.getDefaultCPUProcessor()
 
             # Update GPU processor shaders and textures
-            self._ocio_shader_desc = ocio.GpuShaderDesc.CreateShaderDesc(
+            shader_desc = ocio.GpuShaderDesc.CreateShaderDesc(
                 language=ocio.GPU_LANGUAGE_GLSL_4_0
             )
             self._ocio_proc_cache_id = gpu_proc.getCacheID()
             ocio_gpu_proc = gpu_proc.getDefaultGPUProcessor()
-            ocio_gpu_proc.extractGpuShaderInfo(self._ocio_shader_desc)
+            ocio_gpu_proc.extractGpuShaderInfo(shader_desc)
 
-            self._allocate_ocio_tex()
+            self.ocio_pipeline.set_shader_desc(shader_desc)
+            self.ocio_pipeline.allocate_textures()
             self._build_program()
 
             # Set initial dynamic property state
-            self._update_ocio_dyn_prop(
+            self.ocio_pipeline.update_dynamic_property(
                 ocio.DYNAMIC_PROPERTY_EXPOSURE, self._ocio_exposure
             )
-            self._update_ocio_dyn_prop(
+            self.ocio_pipeline.update_dynamic_property(
                 ocio.DYNAMIC_PROPERTY_GAMMA, self._ocio_gamma
             )
 
@@ -657,7 +451,9 @@ class ImagePlane(QtOpenGLWidgets.QOpenGLWidget):
         :param value: Exposure value in stops
         """
         self._ocio_exposure = value
-        self._update_ocio_dyn_prop(ocio.DYNAMIC_PROPERTY_EXPOSURE, value)
+        self.ocio_pipeline.update_dynamic_property(
+            ocio.DYNAMIC_PROPERTY_EXPOSURE, value
+        )
         self.update()
 
     def gamma(self) -> float:
@@ -682,7 +478,9 @@ class ImagePlane(QtOpenGLWidgets.QOpenGLWidget):
         value = 1.0 / max(0.001, value)
 
         self._ocio_gamma = value
-        self._update_ocio_dyn_prop(ocio.DYNAMIC_PROPERTY_GAMMA, value)
+        self.ocio_pipeline.update_dynamic_property(
+            ocio.DYNAMIC_PROPERTY_GAMMA, value
+        )
         self.update()
 
     def enterEvent(self, event: QtCore.QEvent) -> None:
@@ -709,30 +507,17 @@ class ImagePlane(QtOpenGLWidgets.QOpenGLWidget):
             widget_w = self.width()
             widget_h = self.height()
 
-            # Trace mouse position through the inverse MVP matrix to update sampled
-            # pixel.
-            screen_pos = np.array(
-                [
-                    pos.x() / widget_w * 2.0 - 1.0,
-                    (widget_h - pos.y() - 1) / widget_h * 2.0 - 1.0,
-                    0.0,
-                    1.0,
-                ]
-            )
-            model_pos = (
-                np.linalg.inv(self._proj_mat @ self._model_view_mat)
-                @ screen_pos
-            )
-            pixel_pos = (
-                np.array([model_pos[0] + 0.5, model_pos[1] + 0.5])
-                * self._image_size
+            # Trace mouse position through the inverse MVP matrix to update
+            # the sampled pixel.
+            pixel_pos = self.camera.screen_to_image(
+                pos.x(), pos.y(), widget_w, widget_h
             )
 
             # Broadcast sample position
             if (
                 self._image_array is not None
-                and 0 <= pixel_pos[0] < self._image_size[0]
-                and 0 <= pixel_pos[1] < self._image_size[1]
+                and 0 <= pixel_pos[0] < self.camera.image_size[0]
+                and 0 <= pixel_pos[1] < self.camera.image_size[1]
             ):
                 pixel_x = math.floor(pixel_pos[0])
                 pixel_y = math.floor(pixel_pos[1])
@@ -763,15 +548,15 @@ class ImagePlane(QtOpenGLWidgets.QOpenGLWidget):
 
         # Fit image to frame
         if h > w:
-            min_scale = w / self._image_size[0]
+            min_scale = w / self.camera.image_size[0]
         else:
-            min_scale = h / self._image_size[1]
+            min_scale = h / self.camera.image_size[1]
 
         # Fill frame with 1 pixel with 0.5 pixel overscan
         max_scale = max(w, h) * 1.5
 
-        delta = event.angleDelta().y() / 360.0 * self._image_scale
-        scale = min(max_scale, max(min_scale, self._image_scale - delta))
+        delta = event.angleDelta().y() / 360.0 * self.camera.image_scale
+        scale = min(max_scale, max(min_scale, self.camera.image_scale - delta))
 
         self.zoom(event.position(), scale, update=True, absolute=True)
 
@@ -783,17 +568,13 @@ class ImagePlane(QtOpenGLWidgets.QOpenGLWidget):
 
         :param offset: Offset in pixels
         :param update: Whether to redraw the viewport
-        :param absolute: When True, offset will be treated as an
-            absolute position to translate the viewport from its
-            origin.
+        :param absolute: When True, offset is an absolute position to
+            translate the viewport from its origin.
         """
-        if self._image_scale > 0:
-            if absolute:
-                self._image_pos = offset / self._image_scale
-            else:
-                self._image_pos += offset / self._image_scale
-
-        self._update_model_view_mat(update=update)
+        self.camera.pan(offset, absolute=absolute)
+        self._refresh_tex_interp()
+        if update:
+            self.update()
 
     def zoom(
         self,
@@ -803,47 +584,35 @@ class ImagePlane(QtOpenGLWidgets.QOpenGLWidget):
         absolute: bool = False,
     ) -> None:
         """
-        Zoom the viewport by the specified scale offset amount.
+        Zoom the viewport by the specified scale amount, centered on a point.
 
         :param point: Viewport position to center zoom on
         :param amount: Zoom scale amount
         :param update: Whether to redraw the viewport
-        :param absolute: When True, amount will be treated as an
-            absolute scale to set the viewport to.
+        :param absolute: When True, amount is an absolute scale to set.
         """
-        offset = np.array([*(point - self.rect().center()).toTuple()])
-
-        self.pan(-offset, update=False)
-
-        if absolute:
-            self._image_scale = amount
-        else:
-            self._image_scale += amount
-
-        self._update_model_view_mat(update=False)
-
-        self.pan(offset, update=update)
+        center_offset = np.array([*(point - self.rect().center()).toTuple()])
+        self.camera.zoom(center_offset, amount, absolute=absolute)
+        self._refresh_tex_interp()
+        if update:
+            self.update()
 
         if self._image_array is not None:
-            self.scale_changed.emit(self._image_scale)
+            self.scale_changed.emit(self.camera.image_scale)
 
     def fit(self, update: bool = True) -> None:
         """
-        Pan and zoom so the image fits within the viewport and is
-        centered.
+        Pan and zoom so the image fits within the viewport and is centered.
 
         :param update: Whether to redraw the viewport
         """
-        w, h = self.width(), self.height()
+        self.camera.fit()
+        self._refresh_tex_interp()
+        if update:
+            self.update()
 
-        # Fit image to frame
-        if h > w:
-            scale = w / self._image_size[0]
-        else:
-            scale = h / self._image_size[1]
-
-        self.zoom(QtCore.QPoint(), scale, update=False, absolute=True)
-        self.pan(np.array([0.0, 0.0]), update=update, absolute=True)
+        if self._image_array is not None:
+            self.scale_changed.emit(self.camera.image_scale)
 
     def _install_shortcuts(self) -> None:
         """
@@ -928,8 +697,8 @@ class ImagePlane(QtOpenGLWidgets.QOpenGLWidget):
         # If new shader cache ID matches previous cache ID, existing program
         # can be reused.
         shader_cache_id = self._ocio_shader_cache_id
-        if self._ocio_shader_desc and not force:
-            shader_cache_id = self._ocio_shader_desc.getCacheID()
+        if self.ocio_pipeline.has_shader_desc() and not force:
+            shader_cache_id = self.ocio_pipeline.shader_cache_id()
             if self._ocio_shader_cache_id == shader_cache_id:
                 return
 
@@ -953,10 +722,10 @@ class ImagePlane(QtOpenGLWidgets.QOpenGLWidget):
             GL.glDeleteShader(self._frag_shader)
 
         frag_src = GLSL_FRAG_SRC
-        if self._ocio_shader_desc:
+        if self.ocio_pipeline.has_shader_desc():
             # Inject OCIO shader block
             frag_src = GLSL_FRAG_OCIO_SRC_FMT.format(
-                ocio_src=self._ocio_shader_desc.getShaderText()
+                ocio_src=self.ocio_pipeline.shader_text()
             )
         self._frag_shader = self._compile_shader(
             frag_src, GL.GL_FRAGMENT_SHADER
@@ -984,176 +753,16 @@ class ImagePlane(QtOpenGLWidgets.QOpenGLWidget):
         # Store cache ID to detect reuse
         self._ocio_shader_cache_id = shader_cache_id
 
-    def _orthographic_proj_matrix(
-        self,
-        near: float,
-        far: float,
-        left: float,
-        right: float,
-        top: float,
-        bottom: float,
-    ) -> np.ndarray:
+    def _refresh_tex_interp(self) -> None:
         """
-        Build orthographic projection matrix array from camera frustum
-        parameters.
-        """
-        return orthographic_proj_matrix(near, far, left, right, top, bottom)
-
-    def _update_model_view_mat(self, update: bool = True) -> None:
-        """
-        Re-calculate the model view matrix, which needs to be updated
-        prior to rendering if the image or window size have changed.
-
-        :param bool update: Optionally redraw the window
-        """
-        self._model_view_mat = model_view_matrix(
-            self._image_scale, self._image_pos, self._image_size
-        )
-
-        # Use nearest interpolation when scaling up to see pixels
-        if self._image_scale > 1.0:
-            self._set_ocio_tex_params(GL.GL_TEXTURE_2D, ocio.INTERP_NEAREST)
-        else:
-            self._set_ocio_tex_params(GL.GL_TEXTURE_2D, ocio.INTERP_LINEAR)
-
-        if update:
-            self.update()
-
-    def _set_ocio_tex_params(
-        self, tex_type: GL.GLenum, interpolation: ocio.Interpolation
-    ) -> None:
-        """
-        Set texture parameters for an OCIO LUT texture based on its
-        type and interpolation.
-
-        :param tex_type: OpenGL texture type (GL_TEXTURE_1/2/3D)
-        :param interpolation: Interpolation enum value
+        Use nearest interpolation when zoomed in past 1:1 so pixels are
+        crisp; linear otherwise. (Was part of _update_model_view_mat.)
         """
         self.makeCurrent()
-
-        if interpolation == ocio.INTERP_NEAREST:
-            GL.glTexParameteri(
-                tex_type, GL.GL_TEXTURE_MIN_FILTER, GL.GL_NEAREST
-            )
-            GL.glTexParameteri(
-                tex_type, GL.GL_TEXTURE_MAG_FILTER, GL.GL_NEAREST
-            )
+        if self.camera.image_scale > 1.0:
+            set_texture_interp(GL.GL_TEXTURE_2D, ocio.INTERP_NEAREST)
         else:
-            GL.glTexParameteri(
-                tex_type, GL.GL_TEXTURE_MIN_FILTER, GL.GL_LINEAR
-            )
-            GL.glTexParameteri(
-                tex_type, GL.GL_TEXTURE_MAG_FILTER, GL.GL_LINEAR
-            )
-
-    def _allocate_ocio_tex(self) -> None:
-        """
-        Iterate and allocate 1/2/3D textures needed by the current
-        OCIO GPU processor. 3D LUTs become 3D textures and 1D LUTs
-        become 1D or 2D textures depending on their size. Since
-        textures have a hardware enforced width limitation, large LUTs
-        are wrapped onto multiple rows.
-
-        .. note::
-            Each time this runs, the previous set of textures are
-            deleted from GPU memory first.
-        """
-        if not self._ocio_shader_desc:
-            return
-
-        self.makeCurrent()
-
-        # Delete previous textures
-        self._del_ocio_tex()
-        self._del_ocio_uniforms()
-
-        tex_index = self._ocio_tex_start_index
-
-        # Process 3D textures
-        for tex_info in self._ocio_shader_desc.get3DTextures():
-            tex_data = tex_info.getValues()
-
-            tex = GL.glGenTextures(1)
-            GL.glActiveTexture(GL.GL_TEXTURE0 + tex_index)
-            GL.glBindTexture(GL.GL_TEXTURE_3D, tex)
-            self._set_ocio_tex_params(GL.GL_TEXTURE_3D, tex_info.interpolation)
-            GL.glTexImage3D(
-                GL.GL_TEXTURE_3D,
-                0,
-                GL.GL_RGB32F,
-                tex_info.edgeLen,
-                tex_info.edgeLen,
-                tex_info.edgeLen,
-                0,
-                GL.GL_RGB,
-                GL.GL_FLOAT,
-                tex_data,
-            )
-
-            self._ocio_tex_ids.append(
-                (
-                    tex,
-                    tex_info.textureName,
-                    tex_info.samplerName,
-                    GL.GL_TEXTURE_3D,
-                    tex_index,
-                )
-            )
-            tex_index += 1
-
-        # Process 2D textures
-        for tex_info in self._ocio_shader_desc.getTextures():
-            tex_data = tex_info.getValues()
-
-            internal_fmt = GL.GL_RGB32F
-            fmt = GL.GL_RGB
-            if tex_info.channel == self._ocio_shader_desc.TEXTURE_RED_CHANNEL:
-                internal_fmt = GL.GL_R32F
-                fmt = GL.GL_RED
-
-            tex = GL.glGenTextures(1)
-            GL.glActiveTexture(GL.GL_TEXTURE0 + tex_index)
-
-            if tex_info.height > 1:
-                tex_type = GL.GL_TEXTURE_2D
-                GL.glBindTexture(tex_type, tex)
-                self._set_ocio_tex_params(tex_type, tex_info.interpolation)
-                GL.glTexImage2D(
-                    tex_type,
-                    0,
-                    internal_fmt,
-                    tex_info.width,
-                    tex_info.height,
-                    0,
-                    fmt,
-                    GL.GL_FLOAT,
-                    tex_data,
-                )
-            else:
-                tex_type = GL.GL_TEXTURE_1D
-                GL.glBindTexture(tex_type, tex)
-                self._set_ocio_tex_params(tex_type, tex_info.interpolation)
-                GL.glTexImage1D(
-                    tex_type,
-                    0,
-                    internal_fmt,
-                    tex_info.width,
-                    0,
-                    fmt,
-                    GL.GL_FLOAT,
-                    tex_data,
-                )
-
-            self._ocio_tex_ids.append(
-                (
-                    tex,
-                    tex_info.textureName,
-                    tex_info.samplerName,
-                    tex_type,
-                    tex_index,
-                )
-            )
-            tex_index += 1
+            set_texture_interp(GL.GL_TEXTURE_2D, ocio.INTERP_LINEAR)
 
     def cleanupGL(self) -> None:
         """
@@ -1165,29 +774,10 @@ class ImagePlane(QtOpenGLWidgets.QOpenGLWidget):
 
         self.makeCurrent()
 
-        self._del_ocio_tex()
-        self._del_ocio_uniforms()
+        self.ocio_pipeline.delete_gl()
 
-        if self._image_tex is not None:
-            GL.glDeleteTextures([self._image_tex])
-            self._image_tex = None
-        if self._plane_vao is not None:
-            GL.glDeleteVertexArrays(1, [self._plane_vao])
-            self._plane_vao = None
-        plane_vbos = [
-            vbo
-            for vbo in (
-                self._plane_position_vbo,
-                self._plane_tex_coord_vbo,
-                self._plane_index_vbo,
-            )
-            if vbo is not None
-        ]
-        if plane_vbos:
-            GL.glDeleteBuffers(len(plane_vbos), plane_vbos)
-            self._plane_position_vbo = None
-            self._plane_tex_coord_vbo = None
-            self._plane_index_vbo = None
+        self.geometry.delete_gl()
+
         if self._shader_program is not None:
             GL.glDeleteProgram(self._shader_program)
             self._shader_program = None
@@ -1195,106 +785,14 @@ class ImagePlane(QtOpenGLWidgets.QOpenGLWidget):
         self._gl_ready = False
         self.doneCurrent()
 
-    def _del_ocio_tex(self) -> None:
-        """
-        Delete all OCIO textures from the GPU.
-        """
-        self.makeCurrent()
-
-        for (
-            tex,
-            tex_name,
-            sampler_name,
-            tex_type,
-            tex_index,
-        ) in self._ocio_tex_ids:
-            GL.glDeleteTextures([tex])
-        del self._ocio_tex_ids[:]
-
-    def _use_ocio_tex(self) -> None:
-        """
-        Bind all OCIO textures to the shader program.
-        """
-        self.makeCurrent()
-
-        for (
-            tex,
-            tex_name,
-            sampler_name,
-            tex_type,
-            tex_index,
-        ) in self._ocio_tex_ids:
-            GL.glActiveTexture(GL.GL_TEXTURE0 + tex_index)
-            GL.glBindTexture(tex_type, tex)
-            GL.glUniform1i(
-                GL.glGetUniformLocation(self._shader_program, sampler_name),
-                tex_index,
-            )
-
-    def _del_ocio_uniforms(self) -> None:
-        """
-        Forget about the dynamic property uniforms needed for the
-        previous OCIO shader build.
-        """
-        self._ocio_uniform_ids.clear()
-
-    def _use_ocio_uniforms(self) -> None:
-        """
-        Bind and/or update dynamic property uniforms needed for the
-        current OCIO shader build.
-        """
-        if not self._ocio_shader_desc or not self._shader_program:
-            return
-
-        self.makeCurrent()
-
-        for name, uniform_data in self._ocio_shader_desc.getUniforms():
-            if name not in self._ocio_uniform_ids:
-                uid = GL.glGetUniformLocation(self._shader_program, name)
-                self._ocio_uniform_ids[name] = uid
-            else:
-                uid = self._ocio_uniform_ids[name]
-
-            if uniform_data.type == ocio.UNIFORM_DOUBLE:
-                GL.glUniform1f(uid, uniform_data.getDouble())
-
-    def _update_ocio_dyn_prop(
-        self, prop_type: ocio.DynamicPropertyType, value: Any
-    ) -> None:
-        """
-        Update a specific OCIO dynamic property, which will be passed
-        to the shader program as a uniform.
-
-        :param prop_type: Property type to update. Only one dynamic
-            property per type is supported per processor, so only the
-            first will be updated if there are multiple.
-        :param value: An appropriate value for the specific property
-            type.
-        """
-        if not self._ocio_shader_desc:
-            return
-
-        if self._ocio_shader_desc.hasDynamicProperty(prop_type):
-            dyn_prop = self._ocio_shader_desc.getDynamicProperty(prop_type)
-            dyn_prop.setDouble(value)
-
     def _update_ocio_channel_hot(self, channel: int) -> None:
         """
-        Update the OCIO GPU renderers channel view to either isolate a
+        Update the OCIO GPU renderer's channel view to either isolate a
         specific channel or show them all.
 
         :param channel: ImagePlaneChannels value to toggle channel
             isolation.
         """
-        # If index is in range, and we are viewing all channels, or a channel
-        # other than index, isolate channel at index.
-        if channel < 3 and (
-            all(self._ocio_channel_hot) or not self._ocio_channel_hot[channel]
-        ):
-            for i in range(3):
-                self._ocio_channel_hot[i] = 1 if i == channel else 0
-
-        # Otherwise show all channels
-        else:
-            for i in range(3):
-                self._ocio_channel_hot[i] = 1
+        self._ocio_channel_hot = next_channel_hot(
+            self._ocio_channel_hot, channel
+        )

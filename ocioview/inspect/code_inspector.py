@@ -9,7 +9,7 @@ from pygments.formatters import HtmlFormatter
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from ..constants import ICON_SIZE_TAB
-from ..message_router import MessageRouter
+from ..message_router import MessageRouter, MessageRouterGate
 from ..utils import get_glyph_icon, processor_to_shader_html
 from ..widgets import EnumComboBox, LogView
 
@@ -102,6 +102,7 @@ class CodeInspector(QtWidgets.QWidget):
         self.setLayout(layout)
 
         # Initialize
+        self._gate = MessageRouterGate()
         msg_router = MessageRouter.get_instance()
         msg_router.config_html_ready.connect(self._on_config_html_ready)
         msg_router.ctf_html_ready.connect(self._on_ctf_html_ready)
@@ -229,26 +230,16 @@ class CodeInspector(QtWidgets.QWidget):
                 )
 
     def _on_tab_changed(self, index: int) -> None:
-        """Only update visible tabs."""
-        msg_router = MessageRouter.get_instance()
-
+        """Only request updates for the visible tab's view."""
         if index == -1:
-            msg_router.config_updates_allowed = False
-            msg_router.ctf_updates_allowed = False
-            msg_router.shader_updates_allowed = False
+            self._gate.set_requested()
             return
 
         widget = self.tabs.widget(index)
 
         if widget == self.config_view:
-            msg_router.config_updates_allowed = True
-            msg_router.ctf_updates_allowed = False
-            msg_router.shader_updates_allowed = False
+            self._gate.set_requested("config")
         elif widget == self.ctf_view:
-            msg_router.config_updates_allowed = False
-            msg_router.ctf_updates_allowed = True
-            msg_router.shader_updates_allowed = False
+            self._gate.set_requested("ctf")
         elif widget == self.shader_view:
-            msg_router.config_updates_allowed = False
-            msg_router.ctf_updates_allowed = False
-            msg_router.shader_updates_allowed = True
+            self._gate.set_requested("shader")

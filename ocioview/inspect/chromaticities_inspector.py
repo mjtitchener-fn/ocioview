@@ -21,7 +21,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from ..config_cache import ConfigCache
 from ..constants import ICON_SIZE_TAB
-from ..message_router import MessageRouter
+from ..message_router import MessageRouter, MessageRouterGate
 from ..processor_context import ProcessorContext
 from ..utils import (
     color_space_to_rgb_colourspace,
@@ -187,6 +187,7 @@ class ChromaticitiesInspector(QtWidgets.QWidget):
         vbox_layout.addWidget(self._wgpu_viewer)
         self.setLayout(vbox_layout)
 
+        self._gate = MessageRouterGate()
         msg_router = MessageRouter.get_instance()
         msg_router.config_html_ready.connect(self._on_config_html_ready)
         msg_router.processor_ready.connect(self._on_processor_ready)
@@ -257,25 +258,16 @@ class ChromaticitiesInspector(QtWidgets.QWidget):
         self._setup_visuals()
 
     def showEvent(self, event: QtGui.QShowEvent) -> None:
-        """Start listening for processor updates, if visible."""
+        """Start listening for config/processor/image updates, if visible."""
         super().showEvent(event)
-
-        msg_router = MessageRouter.get_instance()
-        # NOTE: We need to be able to receive notifications about config changes
-        # and this is currently the only way to do that without connecting
-        # to the `ConfigDock.config_changed` signal.
-        msg_router.config_updates_allowed = True
-        msg_router.processor_updates_allowed = True
-        msg_router.image_updates_allowed = True
+        # NOTE: config updates are needed to learn about config changes without
+        # coupling to ConfigDock.config_changed.
+        self._gate.set_requested("config", "processor", "image")
 
     def hideEvent(self, event: QtGui.QHideEvent) -> None:
-        """Stop listening for processor updates, if not visible."""
+        """Stop listening when hidden."""
         super().hideEvent(event)
-
-        msg_router = MessageRouter.get_instance()
-        msg_router.config_updates_allowed = False
-        msg_router.processor_updates_allowed = False
-        msg_router.image_updates_allowed = False
+        self._gate.set_requested()
 
     def _set_rgb_color_space_input_visuals_visibility(self) -> None:
         """Set the visibility of the *input color space* related *Visuals*."""
@@ -371,9 +363,9 @@ class ChromaticitiesInspector(QtWidgets.QWidget):
         )
         self._visuals["rgb_color_space_input_3d"].visible = False
         self._visuals["rgb_color_space_chromaticities_2d"].visible = False
-        self._visuals[
-            "rgb_color_space_chromaticities_2d"
-        ].local.position = np.array([0, 0, 0.00005])
+        self._visuals["rgb_color_space_chromaticities_2d"].local.position = (
+            np.array([0, 0, 0.00005])
+        )
         self._visuals["rgb_color_space_chromaticities_3d"].visible = False
         self._visuals["rgb_scatter_3d"].visible = False
 
@@ -518,12 +510,12 @@ class ChromaticitiesInspector(QtWidgets.QWidget):
             )
 
             if rgb_colourspace is not None:
-                self._visuals[
-                    "rgb_color_space_input_2d"
-                ].colourspace = rgb_colourspace
-                self._visuals[
-                    "rgb_color_space_input_3d"
-                ].colourspace = rgb_colourspace
+                self._visuals["rgb_color_space_input_2d"].colourspace = (
+                    rgb_colourspace
+                )
+                self._visuals["rgb_color_space_input_3d"].colourspace = (
+                    rgb_colourspace
+                )
             self._processor.applyRGB(image_array)
 
         # 2. Convert from chromaticities input space to "CIE-XYZ-D65" interchange

@@ -29,7 +29,6 @@ from .ocio_pipeline import (
     OCIOGpuPipeline,
     build_viewing_pipelines,
     next_channel_hot,
-    set_texture_interp,
 )
 
 logger = logging.getLogger(__name__)
@@ -182,14 +181,20 @@ class ImagePlane(QtOpenGLWidgets.QOpenGLWidget):
         """
         Called whenever the widget is resized.
 
-        :param w: Window width
-        :param h: Window height
+        :param w: Window width (logical pixels)
+        :param h: Window height (logical pixels)
         """
         self.makeCurrent()
 
-        GL.glViewport(0, 0, w, h)
+        # resizeGL receives logical pixels but the framebuffer is device-sized;
+        # work in device pixels so rendering fills it and stays crisp on HiDPI.
+        dpr = self.devicePixelRatioF()
+        device_w = round(w * dpr)
+        device_h = round(h * dpr)
 
-        self.camera.resize(w, h)
+        GL.glViewport(0, 0, device_w, device_h)
+
+        self.camera.resize(device_w, device_h)
         self._refresh_tex_interp()
 
     def paintGL(self) -> None:
@@ -497,20 +502,21 @@ class ImagePlane(QtOpenGLWidgets.QOpenGLWidget):
 
     def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
         pos = event.position()
+        dpr = self.devicePixelRatioF()
 
         if self._mouse_pressed:
-            offset = np.array([*(pos - self._mouse_last_pos).toTuple()])
+            offset = np.array([*(pos - self._mouse_last_pos).toTuple()]) * dpr
             self._mouse_last_pos = pos
 
             self.pan(offset, update=True)
         else:
-            widget_w = self.width()
-            widget_h = self.height()
+            widget_w = self.width() * dpr
+            widget_h = self.height() * dpr
 
             # Trace mouse position through the inverse MVP matrix to update
-            # the sampled pixel.
+            # the sampled pixel (device pixels, matching the framebuffer).
             pixel_pos = self.camera.screen_to_image(
-                pos.x(), pos.y(), widget_w, widget_h
+                pos.x() * dpr, pos.y() * dpr, widget_w, widget_h
             )
 
             # Broadcast sample position
@@ -544,7 +550,8 @@ class ImagePlane(QtOpenGLWidgets.QOpenGLWidget):
         self._mouse_pressed = False
 
     def wheelEvent(self, event: QtGui.QWheelEvent) -> None:
-        w, h = self.width(), self.height()
+        dpr = self.devicePixelRatioF()
+        w, h = self.width() * dpr, self.height() * dpr
 
         # Fit image to frame
         if h > w:
@@ -555,8 +562,9 @@ class ImagePlane(QtOpenGLWidgets.QOpenGLWidget):
         # Fill frame with 1 pixel with 0.5 pixel overscan
         max_scale = max(w, h) * 1.5
 
+        # Wheel away from the user (positive angleDelta) zooms in.
         delta = event.angleDelta().y() / 360.0 * self.camera.image_scale
-        scale = min(max_scale, max(min_scale, self.camera.image_scale - delta))
+        scale = min(max_scale, max(min_scale, self.camera.image_scale + delta))
 
         self.zoom(event.position(), scale, update=True, absolute=True)
 
@@ -586,19 +594,22 @@ class ImagePlane(QtOpenGLWidgets.QOpenGLWidget):
         """
         Zoom the viewport by the specified scale amount, centered on a point.
 
-        :param point: Viewport position to center zoom on
+        :param point: Viewport position to center zoom on (logical pixels)
         :param amount: Zoom scale amount
         :param update: Whether to redraw the viewport
         :param absolute: When True, amount is an absolute scale to set.
         """
-        center_offset = np.array([*(point - self.rect().center()).toTuple()])
+        dpr = self.devicePixelRatioF()
+        center_offset = (
+            np.array([*(point - self.rect().center()).toTuple()]) * dpr
+        )
         self.camera.zoom(center_offset, amount, absolute=absolute)
         self._refresh_tex_interp()
         if update:
             self.update()
 
         if self._image_array is not None:
-            self.scale_changed.emit(self.camera.image_scale)
+            self.scale_changed.emit(self.camera.image_scale / dpr)
 
     def fit(self, update: bool = True) -> None:
         """
@@ -612,7 +623,9 @@ class ImagePlane(QtOpenGLWidgets.QOpenGLWidget):
             self.update()
 
         if self._image_array is not None:
-            self.scale_changed.emit(self.camera.image_scale)
+            self.scale_changed.emit(
+                self.camera.image_scale / self.devicePixelRatioF()
+            )
 
     def _install_shortcuts(self) -> None:
         """
@@ -756,13 +769,9 @@ class ImagePlane(QtOpenGLWidgets.QOpenGLWidget):
     def _refresh_tex_interp(self) -> None:
         """
         Use nearest interpolation when zoomed in past 1:1 so pixels are
-        crisp; linear otherwise. (Was part of _update_model_view_mat.)
+        crisp; linear otherwise.
         """
-        self.makeCurrent()
-        if self.camera.image_scale > 1.0:
-            set_texture_interp(GL.GL_TEXTURE_2D, ocio.INTERP_NEAREST)
-        else:
-            set_texture_interp(GL.GL_TEXTURE_2D, ocio.INTERP_LINEAR)
+        self.geometry.set_image_interp(self.camera.image_scale > 1.0)
 
     def cleanupGL(self) -> None:
         """

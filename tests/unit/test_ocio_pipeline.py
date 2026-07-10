@@ -89,6 +89,31 @@ def test_gpu_exposure_and_gamma_are_dynamic(raw_config):
     assert gamma_tf.getPivot() == 1.0
 
 
+def test_scene_linear_role_adds_scene_linear_conversions(raw_config):
+    # With a scene_linear role defined and a known input color space, both
+    # pipelines gain a to-scene-linear and a to-scene-reference conversion.
+    config = ocio.Config.CreateRaw()
+    config.setRole(ocio.ROLE_SCENE_LINEAR, "raw")
+    gpu, cpu = build_viewing_pipelines(
+        config=config,
+        input_color_space="raw",
+        transform=None,
+        exposure=0.0,
+        gamma=1.0,
+        channel_hot=[1, 1, 1, 1],
+        scene_ref_name="scene_ref",
+    )
+    # CPU: to-scene-linear, to-scene-ref, restore-from-scene-ref.
+    cpu_transforms = list(cpu)
+    assert len(cpu_transforms) == 3
+    assert all(
+        isinstance(cpu_transforms[i], ocio.ColorSpaceTransform)
+        for i in range(3)
+    )
+    # GPU adds exposure, channel view, gamma -> 6.
+    assert len(gpu) == 6
+
+
 def test_next_channel_hot_isolates_channel_from_all():
     assert next_channel_hot([1, 1, 1, 1], 0) == [1, 0, 0, 1]
     assert next_channel_hot([1, 1, 1, 1], 1) == [0, 1, 0, 1]

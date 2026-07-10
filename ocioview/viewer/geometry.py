@@ -144,6 +144,24 @@ class ImagePlaneGeometry:
             image_array.ravel(),
         )
 
+    def set_image_interp(self, nearest: bool) -> None:
+        """
+        Set the image texture's min/mag filtering. Binds the image texture
+        explicitly (rather than relying on the last-bound 2D texture).
+
+        :param nearest: True for GL_NEAREST (crisp pixels when zoomed in),
+            False for GL_LINEAR.
+        """
+        self._make_current()
+        GL.glBindTexture(GL.GL_TEXTURE_2D, self.image_tex)
+        gl_filter = GL.GL_NEAREST if nearest else GL.GL_LINEAR
+        GL.glTexParameteri(
+            GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, gl_filter
+        )
+        GL.glTexParameteri(
+            GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, gl_filter
+        )
+
     def draw(self) -> None:
         """Bind the image texture (unit 0) and VAO and draw the quad."""
         GL.glActiveTexture(GL.GL_TEXTURE0 + 0)

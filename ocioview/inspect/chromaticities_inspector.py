@@ -72,7 +72,12 @@ class ChromaticitiesInspector(QtWidgets.QWidget):
         super().__init__(parent=parent)
 
         colour.utilities.filter_warnings(*[True] * 4)
-        colour.plotting.CONSTANTS_COLOUR_STYLE.font.size = 20
+        # Scale the screen-space label font by the device pixel ratio so it
+        # keeps its physical size against the DPR-aware (higher-resolution)
+        # offscreen render.
+        colour.plotting.CONSTANTS_COLOUR_STYLE.font.size = (
+            20 * self.devicePixelRatioF()
+        )
 
         self._context = None
         self._processor = None

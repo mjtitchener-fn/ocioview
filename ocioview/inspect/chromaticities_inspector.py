@@ -21,7 +21,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from ..config_cache import ConfigCache
 from ..constants import ICON_SIZE_TAB
-from ..message_router import MessageRouter, MessageRouterGate
+from ..message_router import MessageRouter, MessageRouterGate, UpdateType
 from ..processor_context import ProcessorContext
 from ..utils import (
     color_space_to_rgb_colourspace,
@@ -267,7 +267,9 @@ class ChromaticitiesInspector(QtWidgets.QWidget):
         super().showEvent(event)
         # NOTE: config updates are needed to learn about config changes without
         # coupling to ConfigDock.config_changed.
-        self._gate.set_requested("config", "processor", "image")
+        self._gate.set_requested(
+            UpdateType.CONFIG, UpdateType.PROCESSOR, UpdateType.IMAGE
+        )
 
     def hideEvent(self, event: QtGui.QHideEvent) -> None:
         """Stop listening when hidden."""

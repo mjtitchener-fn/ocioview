@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import enum
 import logging
 import re
 import sys
@@ -24,8 +25,14 @@ from .utils import (
 message_queue = SimpleQueue()
 
 
-# Gate-able update types (records the runner only emits when requested)
-UPDATE_TYPES = ("config", "ctf", "image", "processor", "shader")
+class UpdateType(enum.Enum):
+    """Gate-able MessageRouter update categories."""
+
+    CONFIG = "config"
+    CTF = "ctf"
+    IMAGE = "image"
+    PROCESSOR = "processor"
+    SHADER = "shader"
 
 
 class MessageRunner(QtCore.QObject):
@@ -77,13 +84,13 @@ class MessageRunner(QtCore.QObject):
         self._prev_proc_data = None
         self._prev_image_array = None
 
-        self._update_counts = {update_type: 0 for update_type in UPDATE_TYPES}
+        self._update_counts = {update_type: 0 for update_type in UpdateType}
 
-    def updates_allowed(self, update_type: str) -> bool:
+    def updates_allowed(self, update_type: UpdateType) -> bool:
         """Whether the given update type is currently requested."""
         return self._update_counts[update_type] > 0
 
-    def request_updates(self, *update_types: str) -> None:
+    def request_updates(self, *update_types: UpdateType) -> None:
         """
         Register interest in one or more update types. The 0->1 transition
         re-broadcasts that type's last cached record so a newly-interested
@@ -96,7 +103,7 @@ class MessageRunner(QtCore.QObject):
             if self._update_counts[update_type] == 1:
                 self._rebroadcast(update_type)
 
-    def release_updates(self, *update_types: str) -> None:
+    def release_updates(self, *update_types: UpdateType) -> None:
         """Drop interest in one or more update types (floored at zero)."""
         for update_type in update_types:
             if update_type not in self._update_counts:
@@ -105,12 +112,12 @@ class MessageRunner(QtCore.QObject):
                 0, self._update_counts[update_type] - 1
             )
 
-    def _rebroadcast(self, update_type: str) -> None:
+    def _rebroadcast(self, update_type: UpdateType) -> None:
         """Re-queue the last cached record for an update type, if any."""
-        if update_type == "config":
+        if update_type is UpdateType.CONFIG:
             if self._prev_config is not None:
                 message_queue.put_nowait(self._prev_config)
-        elif update_type == "image":
+        elif update_type is UpdateType.IMAGE:
             if self._prev_image_array is not None:
                 message_queue.put_nowait(self._prev_image_array)
         else:  # processor / ctf / shader share the processor record
@@ -124,7 +131,10 @@ class MessageRunner(QtCore.QObject):
     @gpu_language.setter
     def gpu_language(self, gpu_language: ocio.GpuLanguage) -> None:
         self._gpu_language = gpu_language
-        if self.updates_allowed("shader") and self._prev_proc_data is not None:
+        if (
+            self.updates_allowed(UpdateType.SHADER)
+            and self._prev_proc_data is not None
+        ):
             # Rebroadcast last processor record
             message_queue.put_nowait(self._prev_proc_data)
 
@@ -151,7 +161,7 @@ class MessageRunner(QtCore.QObject):
             # OCIO config
             if isinstance(msg_raw, ocio.Config):
                 self._prev_config = msg_raw
-                if self.updates_allowed("config"):
+                if self.updates_allowed(UpdateType.CONFIG):
                     self._handle_config_message(msg_raw)
 
             # OCIO processor
@@ -163,16 +173,16 @@ class MessageRunner(QtCore.QObject):
             ):
                 self._prev_proc_data = msg_raw
                 if (
-                    self.updates_allowed("processor")
-                    or self.updates_allowed("ctf")
-                    or self.updates_allowed("shader")
+                    self.updates_allowed(UpdateType.PROCESSOR)
+                    or self.updates_allowed(UpdateType.CTF)
+                    or self.updates_allowed(UpdateType.SHADER)
                 ):
                     self._handle_processor_message(*msg_raw)
 
             # Image array
             elif isinstance(msg_raw, np.ndarray):
                 self._prev_image_array = msg_raw
-                if self.updates_allowed("image"):
+                if self.updates_allowed(UpdateType.IMAGE):
                     self._handle_image_message(msg_raw)
 
             # Python or OCIO log record
@@ -208,16 +218,16 @@ class MessageRunner(QtCore.QObject):
         :param proc: OCIO processor instance
         """
         try:
-            if self.updates_allowed("processor"):
+            if self.updates_allowed(UpdateType.PROCESSOR):
                 self.processor_ready.emit(
                     proc_context, proc.getDefaultCPUProcessor()
                 )
 
-            if self.updates_allowed("ctf"):
+            if self.updates_allowed(UpdateType.CTF):
                 ctf_html_data, group_tf = processor_to_ctf_html(proc)
                 self.ctf_html_ready.emit(ctf_html_data, group_tf)
 
-            if self.updates_allowed("shader"):
+            if self.updates_allowed(UpdateType.SHADER):
                 gpu_proc = proc.getDefaultGPUProcessor()
                 shader_html_data = processor_to_shader_html(
                     gpu_proc, self._gpu_language
@@ -381,9 +391,9 @@ class MessageRouterGate:
 
     def __init__(self, router: Optional["MessageRouter"] = None) -> None:
         self._router = router
-        self._requested: frozenset[str] = frozenset()
+        self._requested: frozenset[UpdateType] = frozenset()
 
-    def set_requested(self, *update_types: str) -> None:
+    def set_requested(self, *update_types: UpdateType) -> None:
         """Declare the currently-needed update types; diff against the last set."""
         target = frozenset(update_types)
         if target == self._requested:

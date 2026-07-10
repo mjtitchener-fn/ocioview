@@ -9,7 +9,7 @@ from pygments.formatters import HtmlFormatter
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from ..constants import ICON_SIZE_TAB
-from ..message_router import MessageRouter, MessageRouterGate
+from ..message_router import MessageRouter, MessageRouterGate, UpdateType
 from ..utils import get_glyph_icon, processor_to_shader_html
 from ..widgets import EnumComboBox, LogView
 
@@ -238,8 +238,8 @@ class CodeInspector(QtWidgets.QWidget):
         widget = self.tabs.widget(index)
 
         if widget == self.config_view:
-            self._gate.set_requested("config")
+            self._gate.set_requested(UpdateType.CONFIG)
         elif widget == self.ctf_view:
-            self._gate.set_requested("ctf")
+            self._gate.set_requested(UpdateType.CTF)
         elif widget == self.shader_view:
-            self._gate.set_requested("shader")
+            self._gate.set_requested(UpdateType.SHADER)

@@ -11,7 +11,7 @@ import PyOpenColorIO as ocio
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from ..constants import R_COLOR, G_COLOR, B_COLOR, GRAY_COLOR, ICON_SIZE_TAB
-from ..message_router import MessageRouter, MessageRouterGate
+from ..message_router import MessageRouter, MessageRouterGate, UpdateType
 from ..processor_context import ProcessorContext
 from ..utils import get_glyph_icon, SignalsBlocked
 from ..widgets import EnumComboBox, FloatEditArray, IntEdit
@@ -272,7 +272,7 @@ class CurveView(QtWidgets.QGraphicsView):
     def showEvent(self, event: QtGui.QShowEvent) -> None:
         """Start listening for processor updates, if visible."""
         super().showEvent(event)
-        self._gate.set_requested("processor")
+        self._gate.set_requested(UpdateType.PROCESSOR)
 
     def hideEvent(self, event: QtGui.QHideEvent) -> None:
         """Stop listening for processor updates, if not visible."""

@@ -11,7 +11,7 @@ import PyOpenColorIO as ocio
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from ..constants import R_COLOR, G_COLOR, B_COLOR, GRAY_COLOR, ICON_SIZE_TAB
-from ..message_router import MessageRouter
+from ..message_router import MessageRouter, MessageRouterGate, UpdateType
 from ..processor_context import ProcessorContext
 from ..utils import get_glyph_icon, SignalsBlocked
 from ..widgets import EnumComboBox, FloatEditArray, IntEdit
@@ -265,22 +265,19 @@ class CurveView(QtWidgets.QGraphicsView):
 
         # Initialize
         self._update_x_samples()
+        self._gate = MessageRouterGate()
         msg_router = MessageRouter.get_instance()
         msg_router.processor_ready.connect(self._on_processor_ready)
 
     def showEvent(self, event: QtGui.QShowEvent) -> None:
         """Start listening for processor updates, if visible."""
         super().showEvent(event)
-
-        msg_router = MessageRouter.get_instance()
-        msg_router.processor_updates_allowed = True
+        self._gate.set_requested(UpdateType.PROCESSOR)
 
     def hideEvent(self, event: QtGui.QHideEvent) -> None:
         """Stop listening for processor updates, if not visible."""
         super().hideEvent(event)
-
-        msg_router = MessageRouter.get_instance()
-        msg_router.processor_updates_allowed = False
+        self._gate.set_requested()
 
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
         """Re-fit graph on resize, to always be centered."""
@@ -486,9 +483,11 @@ class CurveView(QtWidgets.QGraphicsView):
 
             if x > self._x_min:
                 label_value = round(
-                    x
-                    if self._sample_type == SampleType.LINEAR
-                    else self._x_log[i],
+                    (
+                        x
+                        if self._sample_type == SampleType.LINEAR
+                        else self._x_log[i]
+                    ),
                     2 if self._sample_type == SampleType.LINEAR else 5,
                 )
                 if label_value == 0.0:
@@ -648,9 +647,11 @@ class CurveView(QtWidgets.QGraphicsView):
             fm.boundingRect(
                 text_rect,
                 text_flags,
-                "100.01"
-                if self._sample_type == SampleType.LINEAR
-                else "100.00001",
+                (
+                    "100.01"
+                    if self._sample_type == SampleType.LINEAR
+                    else "100.00001"
+                ),
             ).width()
             + 10
         )

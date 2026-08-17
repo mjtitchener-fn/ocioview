@@ -7,6 +7,8 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from wgpu.gui.offscreen import WgpuCanvas
 from wgpu.gui.qt import BUTTON_MAP, MODIFIERS_MAP
 
+SUPERSAMPLE = 2  # extra oversampling on top of the device pixel ratio
+
 
 class WgpuCanvasOffScreenViewer(QtWidgets.QGraphicsView):
     def __init__(self):
@@ -40,7 +42,6 @@ class WgpuCanvasOffScreenViewer(QtWidgets.QGraphicsView):
             self._render_to_pixmap()
         )
         self.scene().addItem(self.image_plane)
-        self.scale(0.5, 0.5)
 
     @property
     def wgpu_canvas(self):
@@ -64,10 +65,9 @@ class WgpuCanvasOffScreenViewer(QtWidgets.QGraphicsView):
 
     @property
     def _viewport_size(self):
-        return (
-            self.viewport().size().width() * 2,
-            self.viewport().size().height() * 2,
-        )
+        dpr = self.devicePixelRatioF() * SUPERSAMPLE
+        size = self.viewport().size()
+        return (round(size.width() * dpr), round(size.height() * dpr))
 
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
         super().resizeEvent(event)
@@ -149,7 +149,7 @@ class WgpuCanvasOffScreenViewer(QtWidgets.QGraphicsView):
         render = np.array(self._wgpu_renderer.target.draw())[..., :3]
 
         height, width, _channel = render.shape
-        return QtGui.QPixmap.fromImage(
+        pixmap = QtGui.QPixmap.fromImage(
             QtGui.QImage(
                 np.ascontiguousarray(render),
                 width,
@@ -158,3 +158,5 @@ class WgpuCanvasOffScreenViewer(QtWidgets.QGraphicsView):
                 QtGui.QImage.Format_RGB888,
             )
         )
+        pixmap.setDevicePixelRatio(self.devicePixelRatioF() * SUPERSAMPLE)
+        return pixmap
